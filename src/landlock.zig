@@ -181,8 +181,8 @@ pub fn addPort(ll: Landlock, port: u16, options: struct {
     var mask: u32 = 0;
     if (options.bind_tcp)
         mask |= sys.LANDLOCK_ACCESS_NET.BIND_TCP;
-    if (options.bind_tcp)
-        mask |= sys.LANDLOCK_ACCESS_NET.BIND_TCP;
+    if (options.connect_tcp)
+        mask |= sys.LANDLOCK_ACCESS_NET.CONNECT_TCP;
     net_port.port = port;
     net_port.allowed_access = mask;
     try sys.landlock_add_rule(ll.fd, .NET_PORT, &net_port, 0);

@@ -23,8 +23,6 @@ unsupported_action: UnsupportedAction,
 pub fn init(options: Options, unsupported_action: UnsupportedAction) !Landlock {
     const version: u32 = @intCast(try sys.landlock_create_ruleset(null, 0, sys.LANDLOCK_CREATE_RULESET_VERSION));
     var real_options = options; // May be mutated based what `unsupported_action` is.
-    var x: u32 = "foo";
-    _ = &x;
     switch (unsupported_action) {
         .fail => {
             if (version < 2)

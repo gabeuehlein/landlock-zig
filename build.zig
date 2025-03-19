@@ -17,6 +17,8 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_mod,
     });
 
+    _ = b.addModule("landlock", .{ .root_source_file = b.path("src/landlock.zig"), .optimize = optimize, .target = target });
+
     const check = b.step("check", "See if landlock-zig builds");
     check.dependOn(&lib.step);
 }

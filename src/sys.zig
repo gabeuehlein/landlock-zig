@@ -1,23 +1,22 @@
-//! Contains wrappers for the `landlock_*` system calls and associated constants
-//! and structures needed to communicate with the kernel.
-
 const std = @import("std");
 const linux = std.os.linux;
 
 const fd_t = linux.fd_t;
 const E = linux.E;
 
-pub fn landlock_create_ruleset(attr: ?*const landlock_ruleset_attr, size: usize, flags: u32) !fd_t {
+pub fn landlock_create_ruleset(attr: ?*const landlock_ruleset_attr, size: usize, flags: u32) error{ LandlockNotSupported, LandlockDisabled, EmptyAccesses, Unexpected }!fd_t {
     switch (linux.syscall3(.landlock_create_ruleset, @intFromPtr(attr), size, flags)) {
         0...std.math.maxInt(i32) => |fd| return @intCast(fd),
         else => |err| return switch (E.init(err)) {
             .NOSYS => error.LandlockNotSupported,
             .OPNOTSUPP => error.LandlockDisabled,
-            .NOMSG => error.EmptyAccesses,
-            // These named errors can only happen as a result of
-            // invalid internal logic or users using intentionally unsafe options.
-            .@"2BIG", .INVAL, .FAULT => unreachable,
-            else => unreachable,
+            .NOMSG => error.EmptyAccesses, // No restrictions were asked for
+            // These named errors can only happen as a result of invalid internal logic,
+            // icky seccompbpf logic, or users failing to check for supported restrictions.
+            .@"2BIG", .INVAL, .FAULT => {
+                unreachable;
+            },
+            else => return error.Unexpected,
         },
     }
 }
@@ -27,7 +26,7 @@ pub fn landlock_add_rule(
     rule_type: landlock_rule_type,
     attr: ?*const anyopaque,
     flags: u32,
-) !void {
+) error{ LandlockDisabled, InvalidFlags }!void {
     switch (linux.syscall4(.landlock_add_rule, @intCast(ruleset_fd), @intFromEnum(rule_type), @intFromPtr(attr), flags)) {
         0 => {},
         else => |err| return switch (E.init(err)) {
@@ -77,6 +76,11 @@ pub const LANDLOCK_ACCESS_FS = struct {
 pub const LANDLOCK_ACCESS_NET = struct {
     pub const BIND_TCP = 1;
     pub const CONNECT_TCP = 2;
+};
+
+pub const LANDLOCK_SCOPE = struct {
+    pub const ABSTRACT_UNIX_SOCKET = 1;
+    pub const SIGNAL = 2;
 };
 
 pub const LANDLOCK_CREATE_RULESET_VERSION = 1;

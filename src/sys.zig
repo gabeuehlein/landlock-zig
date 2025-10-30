@@ -1,22 +1,19 @@
 const std = @import("std");
+const posix = std.posix;
 const linux = std.os.linux;
 
 const fd_t = linux.fd_t;
 const E = linux.E;
 
-pub fn landlock_create_ruleset(attr: ?*const landlock_ruleset_attr, size: usize, flags: u32) error{ LandlockNotSupported, LandlockDisabled, EmptyAccesses, Unexpected }!fd_t {
+pub fn landlock_create_ruleset(attr: ?*const landlock_ruleset_attr, size: usize, flags: u32) error{ LandlockNotSupported, LandlockDisabled, EmptyAccesses, InvalidFlags, Unexpected }!fd_t {
     switch (linux.syscall3(.landlock_create_ruleset, @intFromPtr(attr), size, flags)) {
         0...std.math.maxInt(i32) => |fd| return @intCast(fd),
         else => |err| return switch (E.init(err)) {
             .NOSYS => error.LandlockNotSupported,
             .OPNOTSUPP => error.LandlockDisabled,
             .NOMSG => error.EmptyAccesses, // No restrictions were asked for
-            // These named errors can only happen as a result of invalid internal logic,
-            // icky seccompbpf logic, or users failing to check for supported restrictions.
-            .@"2BIG", .INVAL, .FAULT => {
-                unreachable;
-            },
-            else => return error.Unexpected,
+            .INVAL => error.InvalidFlags, 
+            else => |e| posix.unexpectedErrno(e),
         },
     }
 }
@@ -26,30 +23,30 @@ pub fn landlock_add_rule(
     rule_type: landlock_rule_type,
     attr: ?*const anyopaque,
     flags: u32,
-) error{ LandlockDisabled, InvalidFlags }!void {
+) error{LandlockDisabled,InvalidFlags,EmptyAccesses,BadFileDescriptor,Unexpected}!void {
     switch (linux.syscall4(.landlock_add_rule, @intCast(ruleset_fd), @intFromEnum(rule_type), @intFromPtr(attr), flags)) {
         0 => {},
         else => |err| return switch (E.init(err)) {
             .OPNOTSUPP => error.LandlockDisabled,
             .INVAL => error.InvalidFlags,
-            .NOMSG => unreachable,
-            .BADF => unreachable,
-            else => unreachable,
+            .NOMSG => error.EmptyAccesses,
+            .BADF => error.BadFileDescriptor,
+            else => |e| posix.unexpectedErrno(e),
         },
     }
 }
 
-pub fn landlock_restrict_self(ruleset_fd: fd_t, flags: u32) !void {
+pub fn landlock_restrict_self(ruleset_fd: fd_t, flags: u32) error{LandlockDisabled,BadFileDescriptor,InvalidFileDescriptor,NotPermitted,TooManyRules,InvalidFlags,Unexpected}!void {
     switch (linux.syscall2(.landlock_restrict_self, @intCast(ruleset_fd), flags)) {
         0 => {},
         else => |err| return switch (E.init(err)) {
             .OPNOTSUPP => error.LandlockDisabled,
-            .INVAL => unreachable,
+            .INVAL => error.InvalidFlags,
             .BADF => error.BadFileDescriptor,
             .BADFD => error.InvalidFileDescriptor,
             .PERM => error.NotPermitted,
             .@"2BIG" => error.TooManyRules,
-            else => unreachable,
+            else => |e| posix.unexpectedErrno(e),
         },
     }
 }

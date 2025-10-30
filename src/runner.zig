@@ -3,7 +3,7 @@
 const std = @import("std");
 const eql = std.mem.eql;
 const sliceTo = std.mem.sliceTo;
-const Landlock = @import("landlock");
+const Landlock = @import("Landlock");
 
 pub fn main() !void {
     var arena_allocator: std.heap.ArenaAllocator = .init(std.heap.smp_allocator);
@@ -24,11 +24,12 @@ pub fn main() !void {
 }
 
 fn usage(exit_code: u8) noreturn {
-    const string = "usage: {s} [--ro <path>...] [--rw <path>...] <program> [args...]\n";
+    const string = "usage: landlock-run [--ro <path>...] [--rw <path>...] [--port <port>...] [--scope-abstract-unix-socket] [--scope-signal] <program> [args...]\n";
     if (exit_code == 0)
-        std.io.getStdOut().writeAll(string) catch {}
+        std.fs.File.stdout().writeAll(string) catch {}
     else
-        std.debug.print(string, .{if (std.os.argv.len < 1) "landlock-runner" else std.os.argv[0]});
+        std.debug.print(string, .{});
+
     std.process.exit(exit_code);
 }
 
@@ -45,15 +46,12 @@ fn isDir(path: [*:0]const u8) bool {
 }
 
 fn setup(argv: []const [*:0]const u8, argi: *usize) !void {
-    var ll = Landlock.init(.{}) catch |e| switch (e) {
-        error.LandlockNotSupported, error.LandlockDisabled => return, // oh well, we tried
-        else => return e,
-    };
-    defer ll.deinit();
     var i = argi.*;
     defer argi.* = i;
 
-    const rw_dir_extra: Landlock.AddPathOptions = .{
+    const gpa = std.heap.smp_allocator;
+
+    const rw_dir_extra: Landlock.Rule.PathBeneath.Access = .{
         .read_dir = true,
         .make_block = true,
         .make_char = true,
@@ -67,18 +65,28 @@ fn setup(argv: []const [*:0]const u8, argi: *usize) !void {
         .remove_dir = true,
     };
 
-    const ro: Landlock.AddPathOptions = .{
+    const ro: Landlock.Rule.PathBeneath.Access = .{
         .read_file = true,
         .exec = true,
     };
 
-    const rw: Landlock.AddPathOptions = .{
+    const rw: Landlock.Rule.PathBeneath.Access = .{
         .read_file = true,
-        .write = true,
+        .write_file = true,
         .exec = true,
         .ioctl_dev = true,
         .truncate = true,
     };
+
+    const ver = try Landlock.queryVersion();
+    
+    var deferred: Landlock.Deferred = try .init(.{
+        .path_beneath = .filled(ver),
+        .net_port = .filled(ver),
+        .scoped = .filled(ver),
+        .version = ver,
+    });
+    defer deferred.deinit(gpa);
 
     while (i < argv.len) : (i += 1) {
         const arg = sliceTo(argv[i], 0);
@@ -90,7 +98,7 @@ fn setup(argv: []const [*:0]const u8, argi: *usize) !void {
             if (isDir(argv[i + 1]))
                 options.read_dir = true;
 
-            try ll.addPath(sliceTo(argv[i + 1], 0), options, .any);
+            try deferred.addRule(gpa, .{ .path_beneath = try .init(sliceTo(argv[i + 1], 0), options, .any) });
             i += 1;
         } else if (eql(u8, arg, "--rw")) {
             if (i + 1 >= argv.len)
@@ -100,21 +108,28 @@ fn setup(argv: []const [*:0]const u8, argi: *usize) !void {
             if (isDir(argv[i + 1]))
                 options = options.orWith(rw_dir_extra);
 
-            try ll.addPath(sliceTo(argv[i + 1], 0), options, .any);
+            try deferred.addRule(gpa, .{ .path_beneath = try .init(sliceTo(argv[i + 1], 0), options, .any) });
             i += 1;
         } else if (eql(u8, arg, "--port")) {
             if (i + 1 >= argv.len)
                 usage(1);
 
             const port = std.fmt.parseInt(u16, sliceTo(argv[i + 1], 0), 0) catch usage(1);
-
-            try ll.addPort(port, .{ .bind_tcp = true, .connect_tcp = true });
+            try deferred.addRule(gpa, .{ .net_port = .{ .port = port, .access = .filled(ver) } });
             i += 1;
+        } else if (eql(u8, arg, "--scope-abstract-unix-socket")) {
+            deferred.options.scoped.abstract_unix_socket = true;
+        } else if (eql(u8, arg, "--scope-signal")) {
+            deferred.options.scoped.signal = true;
         } else if (eql(u8, arg, "--help") or eql(u8, arg, "-h")) {
             usage(0);
         } else {
-            try ll.commit(true);
             break;
         }
     }
+
+    var ll = try deferred.get();
+    defer ll.deinit();
+
+    try ll.commit(true);
 }

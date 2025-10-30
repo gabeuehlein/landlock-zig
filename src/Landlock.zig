@@ -4,10 +4,10 @@
 //! ```zig
 //! pub fn build(b: *Build) !void {
 //!     ...
-//!     const my_cool_module: std.build.Module = ...;
+//!     const my_cool_module: std.Build.Module = ...;
 //!
-//!     const landlock_dep = b.dependency("landlock");
-//!     my_cool_module.addImport(landlock_dep.module("landlock"));
+//!     const landlock_dep = b.dependency("Landlock");
+//!     my_cool_module.addImport(landlock_dep.module("Landlock"));
 //!     ...
 //! }
 //! ```
@@ -15,7 +15,7 @@
 //! This module's root is a distinct `struct` providing the features offered by this library.
 //! It should be used directly and should be treated like any regular data structure (e.g. [std.ArrayListUnmanaged]):
 //! ```zig
-//! const Landlock = @import("landlock");
+//! const Landlock = @import("Landlock");
 //!
 //! ...
 //!
@@ -24,6 +24,230 @@
 //! try ll.commit(true);
 //! ```
 
+const std = @import("std");
+const builtin = @import("builtin");
+const assert = std.debug.assert;
+
+
+/// Low-level wrappers around the `landlock_*` system calls, as well as definitions for Landlock-related constants.
+pub const sys = @import("sys.zig");
+
+const posix = std.posix;
+const linux = std.os.linux;
+
+const fd_t = linux.fd_t;
+
+const Landlock = @This();
+pub const Deferred = @import("Deferred.zig");
+
+pub const Options = struct {
+    path_beneath: Rule.PathBeneath.Access = .{},
+    net_port: Rule.NetPort.Access = .{},
+    scoped: Rule.Scoped.Access = .{},
+    version: ?u32 = null, 
+};
+
+pub const Rule = union(Tag) {
+    path_beneath: PathBeneath,
+    net_port: NetPort,
+    /// This variant is currently unused (hence the `noreturn` payload). It exists for if Landlock's
+    /// scope capabilities are ever extended in such a way that custom scope rules may be added.
+    scoped: noreturn,
+
+    pub const PathBeneath = struct {
+        access: Access,
+        fd: posix.fd_t,
+
+        pub const Access = packed struct(u64) {
+            exec: bool = false,
+            write_file: bool = false,
+            read_file: bool = false,
+            read_dir: bool = false,
+            remove_dir: bool = false,
+            remove_file: bool = false,
+            make_char: bool = false,
+            make_dir: bool = false,
+            make_reg: bool = false,
+            make_sock: bool = false,
+            make_fifo: bool = false,
+            make_block: bool = false,
+            make_sym: bool = false,
+            refer: bool = false,
+            truncate: bool = false,
+            ioctl_dev: bool = false,
+            _48: u48 = 0,
+
+            const compatibility_array: [max_abi_version]u64 = .{
+                (sys.LANDLOCK_ACCESS_FS.MAKE_SYM << 1) - 1,
+                (sys.LANDLOCK_ACCESS_FS.REFER << 1) - 1,
+                (sys.LANDLOCK_ACCESS_FS.TRUNCATE << 1) - 1,
+                (sys.LANDLOCK_ACCESS_FS.TRUNCATE << 1) - 1,
+                (sys.LANDLOCK_ACCESS_FS.IOCTL_DEV << 1) - 1,
+                (sys.LANDLOCK_ACCESS_FS.IOCTL_DEV << 1) - 1,
+            };
+
+            pub fn orWith(a: Access, b: Access) Access {
+                return @bitCast(@as(u64, @bitCast(a)) | @as(u64, @bitCast(b)));
+            }
+
+            pub fn andWith(a: Access, b: Access) Access {
+                return @bitCast(@as(u64, @bitCast(a)) & @as(u64, @bitCast(b)));
+            }
+
+            pub fn filled(version: u32) Access {
+                return @bitCast(compatibility_array[compatIndex(version)]);
+            }
+
+            pub fn fileMask(version: u32) Access {
+                return (Access{
+                    .exec = true,
+                    .write_file = true,
+                    .read_file = true,
+                    .remove_file = true,
+                    .refer = true,
+                    .truncate = true,
+                    .ioctl_dev = true,
+                }).andWith(.filled(version));
+            }
+
+            pub fn dirMask(version: u32) Access {
+                return .filled(version);
+            }
+        };
+        
+        pub const FileKind = enum {
+            any,
+            /// Directory
+            dir,
+            /// Character device
+            char,
+            /// Block device
+            block,
+            /// Regular file
+            file,
+            /// FIFO (first in, first out) file. Also known as a named pipe.
+            fifo,
+            /// Filesystem-based socket (e.g. a UNIX socket)
+            sock,
+        };
+
+        pub const InitError = error{
+            NotDirectory,
+            NotCharDevice,
+            NotBlockDevice,
+            NotFile,
+            NotFifo,
+            NotSock,
+        } || posix.FStatError;
+
+        pub fn init(path: []const u8, access: Access, expected_type: FileKind) (posix.OpenError||InitError)!PathBeneath {
+            const fd = try posix.open(path, .{ .PATH = true, .CLOEXEC = true }, 0);
+            errdefer posix.close(fd);
+
+            return initFd(fd, access, expected_type);
+        }
+
+        pub fn initFd(fd: posix.fd_t, access: Access, expected_type: FileKind) InitError!PathBeneath {
+            if (expected_type != .any) {
+                const stat = try posix.fstat(fd);
+                const S = posix.S;
+                const ty = stat.mode;
+                switch (expected_type) {
+                    .any => unreachable,
+                    .dir => if (!S.ISDIR(ty))
+                        return error.NotDirectory,
+                    .char => if (!S.ISCHR(ty))
+                        return error.NotCharDevice,
+                    .block => if (!S.ISBLK(ty))
+                        return error.NotBlockDevice,
+                    .file => if (!S.ISREG(ty))
+                        return error.NotFile,
+                    .fifo => if (!S.ISFIFO(ty))
+                        return error.NotFifo,
+                    .sock => if (!S.ISSOCK(ty))
+                        return error.NotSock,
+                }
+            }
+
+            return .{ .fd = fd, .access = access };
+        }
+
+        pub fn deinit(pb: PathBeneath) void {
+            posix.close(pb.fd);
+        }
+    };
+
+    pub const NetPort = struct {
+        port: u16,
+        access: Access,
+
+        pub const Access = packed struct(u64) {
+            bind_tcp: bool = false,
+            connect_tcp: bool = false,
+            _62: u62 = 0,
+
+            const compatibility_array: [max_abi_version]u64 = .{
+                0,
+                0,
+                0,
+                (sys.LANDLOCK_ACCESS_NET.CONNECT_TCP << 1) - 1,
+                (sys.LANDLOCK_ACCESS_NET.CONNECT_TCP << 1) - 1,
+                (sys.LANDLOCK_ACCESS_NET.CONNECT_TCP << 1) - 1,
+            };
+
+            pub inline fn orWith(a: Access, b: Access) Access {
+                return @bitCast(@as(u64, @bitCast(a)) | @as(u64, @bitCast(b)));
+            }
+
+            pub inline fn andWith(a: Access, b: Access) Access {
+                return @bitCast(@as(u64, @bitCast(a)) & @as(u64, @bitCast(b)));
+            }
+
+            pub fn filled(version: u32) Access {
+                return @bitCast(compatibility_array[compatIndex(version)]);
+            }
+        };
+    };
+
+    pub const Scoped = struct {
+        access: Access,
+
+        pub const Access = packed struct(u64) {
+            abstract_unix_socket: bool = true,
+            signal: bool = true,
+            _62: u62 = 0,
+
+            const compatibility_array: [max_abi_version]u64 = .{
+                0,
+                0,
+                0,
+                0,
+                0,
+                (sys.LANDLOCK_SCOPE.SIGNAL << 1) - 1,
+            };
+
+            pub inline fn orWith(a: Access, b: Access) Access {
+                return @bitCast(@as(u64, @bitCast(a)) | @as(u64, @bitCast(b)));
+            }
+
+            pub inline fn andWith(a: Access, b: Access) Access {
+                return @bitCast(@as(u64, @bitCast(a)) & @as(u64, @bitCast(b)));
+            }
+
+            pub fn filled(version: u32) Access {
+                return @bitCast(compatibility_array[compatIndex(version)]);
+            }
+        };
+        
+    };
+
+    pub const Tag = enum {
+        path_beneath,
+        net_port,
+        scoped,
+    };
+};
+
 /// The Landlock file descriptor which is referenced in any related syscalls.
 fd: fd_t,
 /// The (cached) detected Landlock ABI version supported by the Linux kernel. If for
@@ -31,16 +255,12 @@ fd: fd_t,
 version: u32,
 
 pub fn init(options: Options) !Landlock {
-    const version = try queryVersion();
-
-    const checked_access_fs = checkRule(version, options.fs, false);
-    const checked_access_net = checkRule(version, options.net, false);
-    const checked_access_scope = checkRule(version, options.scope, false);
+    const version = options.version orelse try queryVersion();
 
     var attrs: sys.landlock_ruleset_attr = .{
-        .handled_access_fs = @as(u64, @bitCast(checked_access_fs)),
-        .handled_access_net = @as(u64, @bitCast(checked_access_net)),
-        .scoped = @as(u64, @bitCast(checked_access_scope)),
+        .handled_access_fs = @as(u64, @bitCast(options.path_beneath)),
+        .handled_access_net = @as(u64, @bitCast(options.net_port)),
+        .scoped = @as(u64, @bitCast(options.scoped)),
     };
 
     return .{
@@ -55,6 +275,7 @@ pub fn init(options: Options) !Landlock {
 pub fn commit(ll: Landlock, set_no_new_privs: bool) !void {
     if (set_no_new_privs)
         _ = try posix.prctl(.SET_NO_NEW_PRIVS, .{ 1, 0, 0, 0 });
+
     try sys.landlock_restrict_self(ll.fd, 0);
 }
 
@@ -63,274 +284,82 @@ pub fn deinit(ll: *Landlock) void {
     posix.close(ll.fd);
 }
 
-/// Adds a filesystem path rule to the Landlock ruleset, following symlinks. Checks that `path`
-/// refers to a file of type `path_kind` if `path_kind != .any`.
-pub fn addPath(ll: Landlock, path: []const u8, options: AddPathOptions, path_kind: AddPathKind) !void {
-    const fd = try posix.open(path, .{
-        .PATH = true,
-        .DIRECTORY = path_kind == .dir,
-        .CLOEXEC = true,
-    }, 0);
-    defer posix.close(fd);
-    if (path_kind != .any) {
-        const stat = try posix.fstat(fd);
-        const S = posix.S;
-        const ty = stat.mode;
-        switch (path_kind) {
-            .any => unreachable,
-            .dir => {}, // handled by opening fd
-            .char => if (!S.ISCHR(ty))
-                return error.NotChar,
-            .block => if (!S.ISBLK(ty))
-                return error.NotBlock,
-            .file => if (!S.ISREG(ty))
-                return error.NotFile,
-            .fifo => if (!S.ISFIFO(ty))
-                return error.NotFifo,
-            .sock => if (!S.ISSOCK(ty))
-                return error.NotSock,
-        }
+/// Adds a rule to the ruleset. As the kernel manages the queued rules, no allocator
+/// is required. Do note, however, that the rule will still need to have its resources
+/// cleaned up (`path_beneath` rules will need to have their file descriptor closed).
+/// For a function that automatically does that, see [addRuleImmediate].
+pub fn addRule(ll: *Landlock, rule: Rule) !void {
+    switch (rule) {
+        .path_beneath => |p| {
+            const path_beneath: sys.landlock_path_beneath_attr = .{
+                .parent_fd = p.fd,
+                .allowed_access = @bitCast(p.access),
+            };
+
+            try sys.landlock_add_rule(ll.fd, .PATH_BENEATH, &path_beneath, 0);
+        },
+        .net_port => |np| {
+            const net_port: sys.landlock_net_port_attr = .{
+                .allowed_access = @bitCast(np.access),
+                .port = np.port,    
+            };
+
+            try sys.landlock_add_rule(ll.fd, .NET_PORT, &net_port, 0);
+        },
+        .scoped => unreachable,
     }
-
-    const path_beneath: sys.landlock_path_beneath_attr = .{
-        .parent_fd = fd,
-        .allowed_access = @bitCast(checkRule(ll.version, options, false)),
-    };
-
-    try sys.landlock_add_rule(ll.fd, .PATH_BENEATH, &path_beneath, 0);
 }
 
-/// Adds a network port rule to the Landlock ruleset.
-pub fn addPort(ll: Landlock, port: u16, options: AddPortOptions) !void {
-    const net_port: sys.landlock_net_port_attr = .{
-        .port = port,
-        .allowed_access = @bitCast(checkRule(ll.version, options, false)),
-    };
+pub fn addRuleImmediate(ll: *Landlock, rule: Rule) !void {
+   defer switch (rule) {
+       .path_beneath => |p| p.deinit(),
+       else => {},
+   };
 
-    try sys.landlock_add_rule(ll.fd, .NET_PORT, &net_port, 0);
+    return addRule(ll, rule);
 }
 
-/// Checks the rule for validity against the Landlock ABI version `version`. If the compile
-/// option `ignore_unsupported` is `true` *or* `force_ignore_unsupported` is `true`, then unsupported
-/// options will be set to `false` (and a debug log will be emitted if `enable_logging == true`). Otherwise, an `assert`
-/// will be made that no unsupported options are present in `options`
-pub fn checkRule(version: u32, options: anytype, comptime force_ignore_unsupported: bool) @TypeOf(options) {
-    const kind: RestrictionType = switch (@TypeOf(options)) {
-        FilesystemControls, AddPathOptions => .fs,
-        NetControls, AddPortOptions => .net,
-        ScopeControls => .scope,
-        else => @compileError("invalid options type '" ++ @typeName(@TypeOf(options)) ++ "'"),
-    };
-    const as_int: u64 = @bitCast(options);
-    const mask = getCompatMask(version, kind);
-    const masked = mask & as_int;
-
-    if (ignore_unsupported or force_ignore_unsupported) {
-        if (enable_logging) {
-            if (masked != as_int) {
-                switch (kind) {
-                    .fs => log.debug("ignoring unsupported filesystem restriction options (mask changed from 0x{x} -> 0x{x})", .{ as_int, masked }),
-                    .net => log.debug("ignoring unsupported network restriction options (mask changed from 0x{x} -> 0x{x})", .{ as_int, masked }),
-                    .scope => log.debug("ignoring unsupported scope restriction options (mask changed from 0x{x} -> 0x{x})", .{ as_int, masked }),
-                }
-            }
-        }
-    } else {
-        assert(ruleIsValidForAbiVersion(version, options)); // set `ignore_unsupported` and `enable_logging` in build.zig to see the mismatched bits
-    }
-
-    return @bitCast(masked);
-}
-
-/// Returns whether the provided `options` is valid for the provided Landlock ABI version. It is considered
-/// to be valid if using the rule is not guaranteed to return an error (related to the rule).
-pub fn ruleIsValidForAbiVersion(version: u32, options: anytype) bool {
-    const kind: RestrictionType = switch (@TypeOf(options)) {
-        FilesystemControls, AddPathOptions => .fs,
-        NetControls, AddPortOptions => .net,
-        ScopeControls => .scope,
-        else => @compileError("invalid options type '" ++ @typeName(@TypeOf(options)) ++ "'"),
-    };
-    const as_int: u64 = @bitCast(options);
-    const mask = getCompatMask(version, kind);
-    const masked = mask & as_int;
-
-    return masked == as_int;
-}
 
 /// Attempts to obtain the Landlock ABI version from the kernel directly.
 pub fn queryVersion() !u32 {
-    const version: u32 = @intCast(try sys.landlock_create_ruleset(null, 0, sys.LANDLOCK_CREATE_RULESET_VERSION));
+    const version: i32 = try sys.landlock_create_ruleset(null, 0, sys.LANDLOCK_CREATE_RULESET_VERSION);
     if (version == 0)
         return error.Unexpected; // Landlock LSM is broken!
-    return version;
-}
 
-pub inline fn getCompatMask(version: u32, req_ty: RestrictionType) u64 {
-    const index = compatIndex(version);
-    return (switch (req_ty) {
-        .fs => fs_compatibility_array,
-        .net => net_compatibility_array,
-        .scope => scope_compatibility_array,
-    })[index];
+    return @intCast(version);
 }
 
 inline fn compatIndex(version: u32) usize {
     return @min(version, max_abi_version) - 1;
 }
 
-const std = @import("std");
-const builtin = @import("builtin");
-const build_options = @import("build_options");
-const log = std.log.scoped(.landlock);
-const assert = std.debug.assert;
-
-const ignore_unsupported = build_options.ignore_unsupported;
-const enable_logging = build_options.enable_logging;
-
-/// Low-level wrappers around the `landlock_*` system calls, as well as definitions for Landlock-related constants.
-pub const sys = @import("sys.zig");
-
-const posix = std.posix;
-const linux = std.os.linux;
-
-const fd_t = linux.fd_t;
-
-const Landlock = @This();
-
-pub const AddPathKind = enum {
-    any,
-    /// Directory
-    dir,
-    /// Character device
-    char,
-    /// Block device
-    block,
-    /// Regular file
-    file,
-    /// FIFO (first in, first out) file. Also known as a named pipe.
-    fifo,
-    /// Filesystem-based socket (e.g. a UNIX socket)
-    sock,
-};
-
-pub const AddPathOptions = packed struct(u64) {
-    exec: bool = false,
-    write: bool = false,
-    read_file: bool = false,
-    read_dir: bool = false,
-    remove_dir: bool = false,
-    remove_file: bool = false,
-    make_char: bool = false,
-    make_dir: bool = false,
-    make_reg: bool = false,
-    make_sock: bool = false,
-    make_fifo: bool = false,
-    make_block: bool = false,
-    make_sym: bool = false,
-    refer: bool = false,
-    truncate: bool = false,
-    ioctl_dev: bool = false,
-    _48: u48 = 0,
-
-    pub inline fn orWith(a: AddPathOptions, b: AddPathOptions) AddPathOptions {
-        return @bitCast(@as(u64, @bitCast(a)) | @as(u64, @bitCast(b)));
-    }
-
-    pub inline fn andWith(a: AddPathOptions, b: AddPathOptions) AddPathOptions {
-        return @bitCast(@as(u64, @bitCast(a)) & @as(u64, @bitCast(b)));
-    }
-};
-pub const AddPortOptions = packed struct(u64) {
-    bind_tcp: bool = false,
-    connect_tcp: bool = false,
-    _62: u62 = 0,
-
-    pub inline fn orWith(a: AddPortOptions, b: AddPortOptions) AddPortOptions {
-        return @bitCast(@as(u64, @bitCast(a)) | @as(u64, @bitCast(b)));
-    }
-
-    pub inline fn andWith(a: AddPortOptions, b: AddPortOptions) AddPortOptions {
-        return @bitCast(@as(u64, @bitCast(a)) & @as(u64, @bitCast(b)));
-    }
-};
-
-pub const Options = struct {
-    fs: FilesystemControls = .{},
-    net: NetControls = .{},
-    scope: ScopeControls = .{},
-};
-
-pub const FilesystemControls = packed struct(u64) {
-    execute: bool = true,
-    write_file: bool = true,
-    read_file: bool = true,
-    read_dir: bool = true,
-    remove_dir: bool = true,
-    remove_file: bool = true,
-    make_char: bool = true,
-    make_dir: bool = true,
-    make_reg: bool = true,
-    make_sock: bool = true,
-    make_fifo: bool = true,
-    make_block: bool = true,
-    make_sym: bool = true,
-    refer: bool = true,
-    truncate: bool = true,
-    ioctl_dev: bool = true,
-    _: u48 = 0,
-};
-
-pub const NetControls = packed struct(u64) {
-    bind_tcp: bool = true,
-    connect_tcp: bool = true,
-    _: u62 = 0,
-};
-
-pub const ScopeControls = packed struct(u64) {
-    abstract_unix_socket: bool = true,
-    signal: bool = true,
-    _: u62 = 0,
-};
-
-pub const RestrictionType = enum { fs, net, scope };
-
 /// The maximum Landlock version supported by this library. Higher versions will be assumed
 /// to support all features this library does.
 pub const max_abi_version = 6;
 
-/// Index into this array is determined by `(landlock ABI version) - 1`
-const fs_compatibility_array: [max_abi_version]u64 = .{
-    (sys.LANDLOCK_ACCESS_FS.MAKE_SYM << 1) - 1,
-    (sys.LANDLOCK_ACCESS_FS.REFER << 1) - 1,
-    (sys.LANDLOCK_ACCESS_FS.TRUNCATE << 1) - 1,
-    (sys.LANDLOCK_ACCESS_FS.TRUNCATE << 1) - 1,
-    (sys.LANDLOCK_ACCESS_FS.IOCTL_DEV << 1) - 1,
-    (sys.LANDLOCK_ACCESS_FS.IOCTL_DEV << 1) - 1,
-};
+test {
+    const ver = try queryVersion() catch |e| switch (e) {
+        error.LandlockDisabled, error.LandlockNotSupported => return error.SkipZigTest,
+        else => return e,
+    };
 
-/// Index into this array is determined by `(landlock ABI version) - 1`
-const net_compatibility_array: [max_abi_version]u64 = .{
-    0,
-    0,
-    0,
-    (sys.LANDLOCK_ACCESS_NET.CONNECT_TCP << 1) - 1,
-    (sys.LANDLOCK_ACCESS_NET.CONNECT_TCP << 1) - 1,
-    (sys.LANDLOCK_ACCESS_NET.CONNECT_TCP << 1) - 1,
-};
+    std.posix.accessZ("/proc/self", posix.F_OK) catch return error.SkipZigTest;
 
-/// Index into this array is determined by `(landlock ABI version) - 1`
-const scope_compatibility_array: [max_abi_version]u64 = .{
-    0,
-    0,
-    0,
-    0,
-    0,
-    (sys.LANDLOCK_SCOPE.SIGNAL << 1) - 1,
-};
+    var ll: Landlock = try .init(.{
+        .path_beneath = .filled(ver),
+        .net_port = .filled(ver),
+        .scoped = .filled(ver),
+        .version = ver,
+    });
+
+    try ll.addRuleImmediate(.{ .path_beneath = try .init("/proc/self", .{ .read_file = true, .read_dir = true, .exec = true }, .dir) });
+
+    try ll.commit(true);
+    try std.posix.accessZ("/proc/self", 0);
+
+    try std.testing.expectError(error.AccessDenied, posix.open("/proc", .{ .DIRECTORY = true, .ACCMODE = .RDONLY }, 0));
+}
 
 comptime {
-    if (builtin.os.tag != .linux)
-        @compileError("Landlock is a mechanism implemented only by the Linux kernel; operating system '" ++ @tagName(builtin.os.tag) ++ "' is not Linux");
     std.testing.refAllDecls(Landlock);
 }
